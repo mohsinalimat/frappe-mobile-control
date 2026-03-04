@@ -45,7 +45,24 @@ def build_auth_response(
 		perms = get_user_permissions(user)
 		response["roles"] = perms["roles"]
 		response["permissions"] = perms["permissions"]
+		response["program_assignments"] = _get_program_assignments(user.name)
 	return response
+
+
+def _get_program_assignments(user: str) -> list[dict[str, Any]]:
+	"""Returns the user's active program assignments with geography restrictions.
+
+	Queries User Program Assignment DocType from rf_mis app.
+	Returns empty list if the DocType doesn't exist (graceful fallback).
+	"""
+	try:
+		return frappe.get_all(
+			"User Program Assignment",
+			filters={"user": user, "is_active": 1},
+			fields=["program", "role_key", "geography"],
+		)
+	except Exception:
+		return []
 
 
 def get_request_metadata() -> tuple[str | None, str | None]:
