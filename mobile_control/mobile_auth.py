@@ -1,3 +1,4 @@
+import hashlib
 import secrets
 import frappe
 from frappe import _
@@ -8,6 +9,15 @@ from frappe.utils import now_datetime, add_to_date, cstr, get_datetime
 ACCESS_TOKEN_HOURS = 24
 REFRESH_TOKEN_DAYS = 30
 OTP_MAX_PER_HOUR = 3
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_SECONDS = 900  # 15 minutes
+REFRESH_MAX_ATTEMPTS = 10
+REFRESH_RATE_LIMIT_SECONDS = 3600  # 1 hour
+
+
+def _hash_token(token):
+	"""Return hex SHA-256 digest of token."""
+	return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _generate_token(nbytes=48):
@@ -75,12 +85,13 @@ def _create_tokens(user, device_uuid=None):
 		"doctype": "Mobile Auth Token",
 		"user": user,
 		"device_uuid": device_uuid or "",
-		"access_token": access_token,
-		"refresh_token": refresh_token,
+		"access_token": _hash_token(access_token),
+		"refresh_token": _hash_token(refresh_token),
 		"access_token_expiry": add_to_date(now, hours=ACCESS_TOKEN_HOURS),
 		"refresh_token_expiry": add_to_date(now, days=REFRESH_TOKEN_DAYS),
 	}).insert(ignore_permissions=True)
 
+	# Return plaintext tokens to the caller; only hashes are stored
 	return access_token, refresh_token
 
 
@@ -104,21 +115,28 @@ def _build_login_response(user, device_uuid=None):
 	}
 
 
-def _check_otp_rate_limit(mobile_no):
-	"""Enforce max OTP_MAX_PER_HOUR OTPs per mobile per hour using Redis."""
-	cache_key = f"mobile_otp_count:{mobile_no}"
-	count = frappe.cache.get(cache_key)
+def _check_rate_limit(cache_key, max_attempts, window_seconds, message=None):
+	"""Atomic rate limiter using Redis INCR.
 
-	if count and int(count) >= OTP_MAX_PER_HOUR:
+	Increments the counter atomically. Sets TTL on the first increment.
+	Throws RateLimitExceededError if the counter exceeds max_attempts.
+	"""
+	redis = frappe.cache.get_connection()  # raw redis connection
+	current = redis.incr(cache_key)
+	if current == 1:
+		redis.expire(cache_key, window_seconds)
+
+	if current > max_attempts:
 		frappe.throw(
-			_("Too many OTP requests. Please try again later."),
+			_(message or "Too many requests. Please try again later."),
 			frappe.RateLimitExceededError,
 		)
 
-	if count:
-		frappe.cache.set(cache_key, int(count) + 1, expires_in_sec=3600)
-	else:
-		frappe.cache.set(cache_key, 1, expires_in_sec=3600)
+
+def _check_otp_rate_limit(mobile_no):
+	"""Enforce max OTP_MAX_PER_HOUR OTPs per mobile per hour using Redis."""
+	cache_key = f"mobile_otp_count:{mobile_no}"
+	_check_rate_limit(cache_key, OTP_MAX_PER_HOUR, 3600, "Too many OTP requests. Please try again later.")
 
 
 def _format_mobile_number(mobile_no):
@@ -137,6 +155,15 @@ def _format_mobile_number(mobile_no):
 @frappe.whitelist(allow_guest=True)
 def login(username, password):
 	"""Stateless login with username + password. Returns tokens + user info."""
+	# Rate limit by IP: 5 attempts per 15 minutes
+	client_ip = frappe.local.request_ip
+	_check_rate_limit(
+		f"mobile_login_rl:{client_ip}",
+		LOGIN_MAX_ATTEMPTS,
+		LOGIN_RATE_LIMIT_SECONDS,
+		"Too many login attempts. Please try again later.",
+	)
+
 	from frappe.auth import LoginManager
 
 	login_manager = LoginManager()
@@ -234,15 +261,31 @@ def refresh_token(refresh_token):
 	"""Refresh expired access token. Must be allow_guest because SDK
 	clears the Bearer token before calling this endpoint.
 	"""
-	token_doc = frappe.db.get_value(
-		"Mobile Auth Token",
-		{"refresh_token": refresh_token},
-		["name", "user", "refresh_token_expiry"],
+	# Rate limit by IP: 10 attempts per hour
+	client_ip = frappe.local.request_ip
+	_check_rate_limit(
+		f"mobile_refresh_rl:{client_ip}",
+		REFRESH_MAX_ATTEMPTS,
+		REFRESH_RATE_LIMIT_SECONDS,
+		"Too many refresh attempts. Please try again later.",
+	)
+
+	refresh_token_hash = _hash_token(refresh_token)
+
+	# Use FOR UPDATE to acquire a row lock, preventing TOCTOU race conditions
+	row = frappe.db.sql(
+		"""SELECT name, user, refresh_token_expiry
+		FROM `tabMobile Auth Token`
+		WHERE refresh_token = %s
+		FOR UPDATE""",
+		(refresh_token_hash,),
 		as_dict=True,
 	)
 
-	if not token_doc:
+	if not row:
 		frappe.throw(_("Invalid refresh token"), frappe.AuthenticationError)
+
+	token_doc = row[0]
 
 	if now_datetime() > get_datetime(token_doc.refresh_token_expiry):
 		# Clean up expired token

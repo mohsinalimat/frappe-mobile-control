@@ -1,5 +1,12 @@
+import hashlib
+
 import frappe
 from frappe.utils import now_datetime
+
+
+def _hash_token(token):
+	"""Return hex SHA-256 digest of token."""
+	return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def validate_bearer_token():
@@ -17,9 +24,11 @@ def validate_bearer_token():
 	if not token:
 		return
 
+	token_hash = _hash_token(token)
+
 	token_doc = frappe.db.get_value(
 		"Mobile Auth Token",
-		{"access_token": token},
+		{"access_token": token_hash},
 		["name", "user", "access_token_expiry"],
 		as_dict=True,
 	)
